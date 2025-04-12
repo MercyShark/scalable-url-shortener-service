@@ -11,6 +11,11 @@ from fastapi.security import OAuth2PasswordBearer
 from generate_url_code import get_url_code
 import random
 from fastapi.responses import RedirectResponse
+import uuid
+import aio_pika
+import json
+from user_agents import parse
+from datetime import datetime
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
@@ -18,6 +23,13 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 async def lifespan(app: FastAPI):
 
     print("Starting up...")
+
+    connection = await aio_pika.connect_robust(os.getenv("RABBITMQ_URL"), heartbeat=60)
+    channel = await connection.channel()
+    await channel.declare_queue(os.getenv("RABBITMQ_MESSAGE_QUEUE_NAME"),durable=True) # add durable attribute in production
+
+    app.state.rabbit_connection = connection
+    app.state.rabbit_channel = channel
     db = Database()
     with db.get_connection() as conn:
         with conn.cursor() as cur:
@@ -35,10 +47,17 @@ async def lifespan(app: FastAPI):
 
     print("Shutting down...")
     db.close_all_connections()
+    await connection.close()
+
     del app.state.name
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+
+
+
 
 
 def get_db_connection(request: Request):
@@ -47,6 +66,9 @@ def get_db_connection(request: Request):
 
 def get_avaiable_range_list(request: Request):
     return request.app.state.avail_range
+
+def get_message_queue_channel(request: Request):
+    return request.app.state.rabbit_channel
 
 def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db_connection)) -> dict:
     payload = verify_token(token) 
@@ -239,8 +261,41 @@ async def protected_route(url : str = Query, current_user: dict = Depends(get_cu
                     print("Error:", e)
 
 
+
+
+def get_analystics_payload(request: Request, original_url ,short_url):
+    request_id = str(uuid.uuid4())
+                # location = get_ip_location(client_ip)
+
+    timestamp = datetime.utcnow().isoformat()
+    client_ip = request.client.host
+    
+    user_agent = request.headers.get("User-Agent", "")
+    parsed_user_agent = parse(user_agent)
+    browser = parsed_user_agent.browser.family
+    os = parsed_user_agent.os.family
+    device = parsed_user_agent.device.family
+
+
+    referrer = request.headers.get("Referer", "")
+
+    payload = {
+    "request_id": request_id,
+    "original_url": original_url,
+    "short_url": short_url,
+    "timestamp": timestamp,
+    "ip_address": client_ip,
+    # "location": location,
+    "browser": browser,
+    "os": os,
+    "device": device,
+    "referrer": referrer,
+    "priority": 1  # Optional: Can be used for task prioritization
+    }
+    return payload
+                
 @app.get("/{short_code}")
-async def resolve_short_url(short_code: str, db = Depends(get_db_connection)):     
+async def resolve_short_url(request: Request, short_code: str, db = Depends(get_db_connection), message_queue_channel = Depends(get_message_queue_channel)):     
     with db.get_connection() as conn:
         with conn.cursor() as cur:
             try:
@@ -249,6 +304,15 @@ async def resolve_short_url(short_code: str, db = Depends(get_db_connection)):
                     where url_code = %s
                 """, (short_code,))
                 url = cur.fetchone()[0]
+
+                payload = get_analystics_payload(request,url,f"http://{os.getenv('HOST')}:{os.getenv('PORT')}/{short_code}")
+                json_body = json.dumps(payload).encode("utf-8")
+                await message_queue_channel.default_exchange.publish(
+                    aio_pika.Message(body=json_body,content_type="application/json",delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
+                    routing_key=os.getenv("RABBITMQ_MESSAGE_QUEUE_NAME"),
+                )
+                print("called 2")
+
                 return RedirectResponse(url=url)
 
             except Exception as e:
